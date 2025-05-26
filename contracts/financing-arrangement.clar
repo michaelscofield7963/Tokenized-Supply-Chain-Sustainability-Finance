@@ -1,142 +1,169 @@
-;; Financing Arrangement Contract
-;; Links funding to sustainability goals and manages financing pools
+;; Performance Monitoring Contract
+;; Tracks sustainability improvements and progress against goals
 
 (define-constant CONTRACT_OWNER tx-sender)
-(define-constant ERR_UNAUTHORIZED (err u300))
-(define-constant ERR_INSUFFICIENT_FUNDS (err u301))
-(define-constant ERR_ARRANGEMENT_NOT_FOUND (err u302))
-(define-constant ERR_INVALID_TERMS (err u303))
-(define-constant ERR_ARRANGEMENT_EXPIRED (err u304))
+(define-constant ERR_UNAUTHORIZED (err u400))
+(define-constant ERR_INVALID_DATA (err u401))
+(define-constant ERR_MILESTONE_NOT_FOUND (err u402))
 
-;; Financing arrangement structure
-(define-map financing-arrangements
-  { arrangement-id: uint }
+;; Performance milestone structure
+(define-map performance-milestones
+  { entity-id: uint, milestone-id: uint }
   {
-    entity-id: uint,
-    funder: principal,
-    amount: uint,
     target-score: uint,
-    duration-blocks: uint,
-    start-block: uint,
-    interest-rate: uint, ;; basis points (e.g., 500 = 5%)
-    status: uint, ;; 0=active, 1=completed, 2=defaulted
-    disbursed: bool
+    current-score: uint,
+    deadline-block: uint,
+    achieved: bool,
+    achievement-block: uint,
+    verifier: principal
   }
 )
 
-;; Arrangement counter
-(define-data-var arrangement-counter uint u0)
+;; Milestone counter per entity
+(define-map entity-milestone-count { entity-id: uint } uint)
 
-;; Funding pool
-(define-data-var total-pool uint u0)
+;; Performance history
+(define-map performance-history
+  { entity-id: uint, period: uint }
+  {
+    carbon-improvement: int,
+    water-improvement: int,
+    waste-improvement: int,
+    energy-improvement: int,
+    overall-improvement: int,
+    timestamp: uint
+  }
+)
 
-;; Status constants
-(define-constant STATUS_ACTIVE u0)
-(define-constant STATUS_COMPLETED u1)
-(define-constant STATUS_DEFAULTED u2)
+;; Authorized monitors
+(define-map monitors principal bool)
 
-;; Create financing arrangement
-(define-public (create-arrangement
+;; Initialize contract owner as monitor
+(map-set monitors CONTRACT_OWNER true)
+
+;; Create performance milestone
+(define-public (create-milestone
   (entity-id uint)
-  (amount uint)
   (target-score uint)
-  (duration-blocks uint)
-  (interest-rate uint))
+  (deadline-block uint))
 
-  (let ((arrangement-id (+ (var-get arrangement-counter) u1)))
-    ;; Validate terms
-    (asserts! (> amount u0) ERR_INVALID_TERMS)
-    (asserts! (and (>= target-score u0) (<= target-score u100)) ERR_INVALID_TERMS)
-    (asserts! (> duration-blocks u0) ERR_INVALID_TERMS)
-    (asserts! (<= interest-rate u10000) ERR_INVALID_TERMS) ;; Max 100%
+  (let (
+    (milestone-count (default-to u0 (map-get? entity-milestone-count { entity-id: entity-id })))
+    (milestone-id (+ milestone-count u1))
+  )
+    ;; Validate inputs
+    (asserts! (and (>= target-score u0) (<= target-score u100)) ERR_INVALID_DATA)
+    (asserts! (> deadline-block block-height) ERR_INVALID_DATA)
 
-    ;; Check sufficient funds
-    (asserts! (>= (stx-get-balance (as-contract tx-sender)) amount) ERR_INSUFFICIENT_FUNDS)
-
-    ;; Create arrangement
-    (map-set financing-arrangements
-      { arrangement-id: arrangement-id }
+    ;; Create milestone
+    (map-set performance-milestones
+      { entity-id: entity-id, milestone-id: milestone-id }
       {
-        entity-id: entity-id,
-        funder: tx-sender,
-        amount: amount,
         target-score: target-score,
-        duration-blocks: duration-blocks,
-        start-block: block-height,
-        interest-rate: interest-rate,
-        status: STATUS_ACTIVE,
-        disbursed: false
+        current-score: u0,
+        deadline-block: deadline-block,
+        achieved: false,
+        achievement-block: u0,
+        verifier: tx-sender
       }
     )
 
-    ;; Transfer funds to contract
-    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-    (var-set total-pool (+ (var-get total-pool) amount))
-    (var-set arrangement-counter arrangement-id)
+    ;; Update milestone count
+    (map-set entity-milestone-count { entity-id: entity-id } milestone-id)
 
-    (ok arrangement-id)
+    (ok milestone-id)
   )
 )
 
-;; Disburse funds (when sustainability target is met)
-(define-public (disburse-funds (arrangement-id uint) (entity-owner principal))
-  (let ((arrangement (unwrap! (map-get? financing-arrangements { arrangement-id: arrangement-id }) ERR_ARRANGEMENT_NOT_FOUND)))
-    ;; Only funder can disburse
-    (asserts! (is-eq tx-sender (get funder arrangement)) ERR_UNAUTHORIZED)
+;; Update milestone progress
+(define-public (update-milestone-progress
+  (entity-id uint)
+  (milestone-id uint)
+  (current-score uint))
 
-    ;; Check arrangement is active and not disbursed
-    (asserts! (is-eq (get status arrangement) STATUS_ACTIVE) ERR_INVALID_TERMS)
-    (asserts! (not (get disbursed arrangement)) ERR_INVALID_TERMS)
+  (let ((milestone (unwrap! (map-get? performance-milestones { entity-id: entity-id, milestone-id: milestone-id }) ERR_MILESTONE_NOT_FOUND)))
+    ;; Only authorized monitors can update
+    (asserts! (default-to false (map-get? monitors tx-sender)) ERR_UNAUTHORIZED)
 
-    ;; Transfer funds to entity
-    (try! (as-contract (stx-transfer? (get amount arrangement) tx-sender entity-owner)))
+    ;; Validate score
+    (asserts! (and (>= current-score u0) (<= current-score u100)) ERR_INVALID_DATA)
 
-    ;; Update arrangement
-    (map-set financing-arrangements
-      { arrangement-id: arrangement-id }
-      (merge arrangement { disbursed: true })
-    )
-
-    (var-set total-pool (- (var-get total-pool) (get amount arrangement)))
-    (ok true)
-  )
-)
-
-;; Complete arrangement
-(define-public (complete-arrangement (arrangement-id uint))
-  (let ((arrangement (unwrap! (map-get? financing-arrangements { arrangement-id: arrangement-id }) ERR_ARRANGEMENT_NOT_FOUND)))
-    ;; Only funder can complete
-    (asserts! (is-eq tx-sender (get funder arrangement)) ERR_UNAUTHORIZED)
-
-    (map-set financing-arrangements
-      { arrangement-id: arrangement-id }
-      (merge arrangement { status: STATUS_COMPLETED })
+    ;; Check if milestone achieved
+    (let ((achieved (>= current-score (get target-score milestone))))
+      (map-set performance-milestones
+        { entity-id: entity-id, milestone-id: milestone-id }
+        (merge milestone {
+          current-score: current-score,
+          achieved: achieved,
+          achievement-block: (if achieved block-height u0)
+        })
+      )
     )
 
     (ok true)
   )
 )
 
-;; Get arrangement details
-(define-read-only (get-arrangement (arrangement-id uint))
-  (map-get? financing-arrangements { arrangement-id: arrangement-id })
+;; Record performance improvement
+(define-public (record-improvement
+  (entity-id uint)
+  (carbon-change int)
+  (water-change int)
+  (waste-change int)
+  (energy-change int))
+
+  (let (
+    (period block-height)
+    (overall-change (/ (+ carbon-change water-change waste-change energy-change) 4))
+  )
+    ;; Only authorized monitors can record
+    (asserts! (default-to false (map-get? monitors tx-sender)) ERR_UNAUTHORIZED)
+
+    ;; Record improvement
+    (map-set performance-history
+      { entity-id: entity-id, period: period }
+      {
+        carbon-improvement: carbon-change,
+        water-improvement: water-change,
+        waste-improvement: waste-change,
+        energy-improvement: energy-change,
+        overall-improvement: overall-change,
+        timestamp: block-height
+      }
+    )
+
+    (ok true)
+  )
 )
 
-;; Check if arrangement is expired
-(define-read-only (is-arrangement-expired (arrangement-id uint))
-  (match (map-get? financing-arrangements { arrangement-id: arrangement-id })
-    arrangement
-      (> block-height (+ (get start-block arrangement) (get duration-blocks arrangement)))
+;; Add authorized monitor
+(define-public (add-monitor (monitor principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set monitors monitor true)
+    (ok true)
+  )
+)
+
+;; Get milestone details
+(define-read-only (get-milestone (entity-id uint) (milestone-id uint))
+  (map-get? performance-milestones { entity-id: entity-id, milestone-id: milestone-id })
+)
+
+;; Get performance history
+(define-read-only (get-performance-history (entity-id uint) (period uint))
+  (map-get? performance-history { entity-id: entity-id, period: period })
+)
+
+;; Check if milestone is achieved
+(define-read-only (is-milestone-achieved (entity-id uint) (milestone-id uint))
+  (match (map-get? performance-milestones { entity-id: entity-id, milestone-id: milestone-id })
+    milestone (get achieved milestone)
     false
   )
 )
 
-;; Get total funding pool
-(define-read-only (get-total-pool)
-  (var-get total-pool)
-)
-
-;; Get arrangement count
-(define-read-only (get-arrangement-count)
-  (var-get arrangement-counter)
+;; Get entity milestone count
+(define-read-only (get-milestone-count (entity-id uint))
+  (default-to u0 (map-get? entity-milestone-count { entity-id: entity-id }))
 )
